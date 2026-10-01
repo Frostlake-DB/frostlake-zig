@@ -157,10 +157,16 @@ pub const PlaceholderIterator = struct {
                     // A colon glued to the END of an expression is Snowflake's VARIANT path
                     // access (`v:field`, `PARSE_JSON('…'):k`, `{'a':1}:a`, `"V":k`), not a bind
                     // marker — a marker follows an operator, comma or keyword boundary instead.
+                    //
+                    // A positional `?` ends an expression too: it is replaced by the value it
+                    // binds, and a VARIANT one renders as `PARSE_JSON('…')`, which takes a path.
+                    // Without it here, `SELECT ?:a` read `:a` as a named placeholder and the
+                    // statement was refused for mixing two placeholder styles the caller never
+                    // mixed.
                     if (i > 0) {
                         const prev = self.sql[i - 1];
                         if (isWordByte(prev) or prev == ')' or prev == ']' or
-                            prev == '}' or prev == '"' or prev == '\'')
+                            prev == '}' or prev == '"' or prev == '\'' or prev == '?')
                         {
                             self.i = i + 1;
                             continue;
@@ -342,6 +348,78 @@ pub fn statementChangesScope(statement: []const u8) bool {
         return std.mem.eql(u8, word, "DATABASE") or std.mem.eql(u8, word, "SCHEMA");
     }
     return false;
+}
+
+/// The modifiers `touchesSession` steps over: the scope check's own, and the rarer ones that
+/// may also sit before an object's kind.
+fn isSessionModifier(word: []const u8) bool {
+    return isObjectModifier(word) or
+        std.mem.eql(u8, word, "RECURSIVE") or
+        std.mem.eql(u8, word, "MATERIALIZED") or
+        std.mem.eql(u8, word, "EXTERNAL");
+}
+
+/// Whether a single statement leaves context behind that a fresh session on the DSN's scope
+/// would not have: a moved scope (`USE`, `CREATE` or `DROP` of a `DATABASE` or `SCHEMA`), a
+/// session variable or setting (`SET`, `UNSET`, `ALTER SESSION`), or a temporary object.
+///
+/// A lost session that held any of it is reported rather than replaced. This is wider than
+/// `statementChangesScope`, which decides only whether the scope has to be put back: a
+/// temporary table leaves the scope alone, but a statement re-run without it reads something
+/// else.
+pub fn touchesSession(statement: []const u8) bool {
+    var buffer: [64]u8 = undefined;
+    var words = LeadingWordIterator.init(statement, &buffer);
+
+    const first = words.next() orelse return false;
+    if (std.mem.eql(u8, first, "USE") or
+        std.mem.eql(u8, first, "SET") or
+        std.mem.eql(u8, first, "UNSET")) return true;
+
+    const alter = std.mem.eql(u8, first, "ALTER");
+    const create = std.mem.eql(u8, first, "CREATE");
+    if (!alter and !create and !std.mem.eql(u8, first, "DROP")) return false;
+
+    // Step over the modifiers between the verb and the object it names, noting a temporary one.
+    var temporary = false;
+    while (words.next()) |word| {
+        if (isSessionModifier(word)) {
+            if (std.mem.eql(u8, word, "TEMPORARY") or
+                std.mem.eql(u8, word, "TEMP") or
+                std.mem.eql(u8, word, "VOLATILE")) temporary = true;
+            continue;
+        }
+        if (alter) return std.mem.eql(u8, word, "SESSION");
+        if (std.mem.eql(u8, word, "DATABASE") or std.mem.eql(u8, word, "SCHEMA")) return true;
+        return create and temporary;
+    }
+    return create and temporary;
+}
+
+/// What a statement does to the session's transaction.
+pub const TransactionEffect = enum { begins, ends, none };
+
+/// Read a single statement's effect on the session's transaction.
+///
+/// `BEGIN` on its own, or with `TRANSACTION`, `WORK` or `NAME`, opens one, as does
+/// `START TRANSACTION`; `BEGIN` followed by a statement opens a scripting block instead.
+/// `COMMIT` and `ROLLBACK` end one.
+pub fn transactionEffect(statement: []const u8) TransactionEffect {
+    var buffer: [64]u8 = undefined;
+    var words = LeadingWordIterator.init(statement, &buffer);
+
+    const first = words.next() orelse return .none;
+    if (std.mem.eql(u8, first, "COMMIT") or std.mem.eql(u8, first, "ROLLBACK")) return .ends;
+    if (std.mem.eql(u8, first, "START")) {
+        const second = words.next() orelse return .none;
+        return if (std.mem.eql(u8, second, "TRANSACTION")) .begins else .none;
+    }
+    if (!std.mem.eql(u8, first, "BEGIN")) return .none;
+    const second = words.next() orelse return .begins;
+    if (std.mem.eql(u8, second, "TRANSACTION") or
+        std.mem.eql(u8, second, "WORK") or
+        std.mem.eql(u8, second, "NAME")) return .begins;
+    return .none;
 }
 
 /// Whether a request — which may hold several statements — can move the session's scope.

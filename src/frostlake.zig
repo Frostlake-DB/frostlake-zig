@@ -31,6 +31,7 @@ pub const decode = @import("decode.zig");
 
 const connection_mod = @import("connection.zig");
 pub const Connection = connection_mod.Connection;
+pub const ExecuteOptions = connection_mod.ExecuteOptions;
 pub const scope_refresh_after_ms = connection_mod.scope_refresh_after_ms;
 
 const diag_mod = @import("diag.zig");

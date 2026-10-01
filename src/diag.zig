@@ -44,6 +44,13 @@ pub const Error = error{
     /// A transaction call arrived in the wrong order — committing without beginning, or
     /// beginning inside a transaction that is already open.
     InvalidTransactionState,
+    /// The engine no longer holds the connection's session — it expired, was released, or the
+    /// server restarted — and the statement was NOT run, because it depended on something that
+    /// went with the session: an open transaction, or context set up on it (`USE`, `SET`,
+    /// `ALTER SESSION` or a temporary object). The connection stays usable: its next statement
+    /// starts a fresh session on the DSN's scope, once `commit` or `rollback` has ended a
+    /// transaction `begin` opened.
+    SessionLost,
 } || Allocator.Error;
 
 /// How much of an unrecognised response body is kept for reporting. The body is not buffered

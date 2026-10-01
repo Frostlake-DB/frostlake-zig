@@ -195,6 +195,20 @@ test "scan: named markers, and the colons that are not markers" {
     try testing.expectEqual(@as(usize, 0), countMarkers("SELECT PARSE_JSON('{}'):k").named);
     try testing.expectEqual(@as(usize, 0), countMarkers("SELECT \"V\":k FROM t").named);
     try testing.expectEqual(@as(usize, 0), countMarkers("SELECT a[0]:k FROM t").named);
+    // A positional marker ends an expression too, so a path read straight off one is a path and
+    // not a second, named placeholder: `SELECT ?:a` is one `?` and nothing else.
+    const off_positional = countMarkers("SELECT ?:a AS V");
+    try testing.expectEqual(@as(usize, 0), off_positional.named);
+    try testing.expectEqual(@as(usize, 1), off_positional.positional);
+    try testing.expect(!off_positional.isMixed());
+    // Deeper paths and a marker used twice keep counting the same way.
+    try testing.expectEqual(@as(usize, 0), countMarkers("SELECT ?:a.b[0]:c").named);
+    try testing.expectEqual(@as(usize, 2), countMarkers("SELECT ?:a, ?:b").positional);
+    // A cast off a marker is still a cast, not a path and not a name.
+    try testing.expectEqual(@as(usize, 0), countMarkers("SELECT ?::FLOAT").named);
+    try testing.expectEqual(@as(usize, 1), countMarkers("SELECT ?::FLOAT").positional);
+    // A colon that is NOT glued to the marker is still a named placeholder.
+    try testing.expectEqual(@as(usize, 1), countMarkers("SELECT ?, :a").distinct_named);
 
     // A marker after an operator, comma or keyword boundary is real.
     try testing.expectEqual(@as(usize, 1), countMarkers("SELECT * FROM t WHERE x = :a").distinct_named);
@@ -278,7 +292,7 @@ test "render: scalars" {
     try expectRenders(Value.of(@as(i64, 42)), "42");
     // A negative in parentheses: bare after a minus it would open a -- comment.
     try expectRenders(Value.of(@as(i64, -7)), "(-7)");
-    try expectRenders(Value.of(@as(f64, -1.5)), "(-1.5)");
+    try expectRenders(Value.of(@as(f64, -1.5)), "(-1.5::FLOAT)");
 }
 
 test "render: strings escape backslashes and quotes" {
@@ -290,9 +304,10 @@ test "render: strings escape backslashes and quotes" {
 }
 
 test "render: floats keep their type and spell the special values" {
-    try expectRenders(Value.of(@as(f64, 1.5)), "1.5");
-    // A whole float keeps a fractional part; without one it would bind as an integer.
-    try expectRenders(Value.of(@as(f64, 2.0)), "2.0");
+    // Every finite value carries the cast: a bare numeral is fixed-point on the account, so 1.5
+    // would arrive as NUMBER(2,1) and a whole 2.0 as NUMBER(1,0) — the integer 2's own type.
+    try expectRenders(Value.of(@as(f64, 1.5)), "1.5::FLOAT");
+    try expectRenders(Value.of(@as(f64, 2.0)), "2::FLOAT");
     try expectRenders(Value.of(@as(f64, std.math.nan(f64))), "'NaN'::FLOAT");
     try expectRenders(Value.of(@as(f64, std.math.inf(f64))), "'Infinity'::FLOAT");
     try expectRenders(Value.of(@as(f64, -std.math.inf(f64))), "'-Infinity'::FLOAT");
@@ -341,7 +356,7 @@ test "render: temporals" {
 
 test "render: Value.of infers from the Zig type" {
     try expectRenders(Value.of(1), "1");
-    try expectRenders(Value.of(1.25), "1.25");
+    try expectRenders(Value.of(1.25), "1.25::FLOAT");
     try expectRenders(Value.of("x"), "'x'");
     try expectRenders(Value.of(true), "TRUE");
     // An optional binds its payload, or NULL.
@@ -597,6 +612,36 @@ test "wire: a request with no session omits the field" {
     try testing.expectEqualStrings("{\"sql\":\"SELECT 1\",\"autoCommit\":true}", body);
 }
 
+test "wire: a request declares a statement count only when one was asked for" {
+    // Nothing asked, so the field is absent — not null, not zero — and the session answers for
+    // the request exactly as it did before the option existed.
+    const plain = try frostlake.wire.encodeRequest(testing.allocator, .{ .sql = "SELECT 1" });
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "multiStatementCount") == null);
+
+    const packed_body = try frostlake.wire.encodeRequest(testing.allocator, .{
+        .sql = "SELECT 1; SELECT 2",
+        .multi_statement_count = 2,
+    });
+    defer testing.allocator.free(packed_body);
+    try testing.expectEqualStrings(
+        "{\"sql\":\"SELECT 1; SELECT 2\",\"autoCommit\":true,\"multiStatementCount\":2}",
+        packed_body,
+    );
+
+    // Zero is a count like any other — any number of statements — not an absent one.
+    const any = try frostlake.wire.encodeRequest(testing.allocator, .{
+        .sql = "SELECT 1; SELECT 2",
+        .session_id = "s-1",
+        .multi_statement_count = 0,
+    });
+    defer testing.allocator.free(any);
+    try testing.expectEqualStrings(
+        "{\"sql\":\"SELECT 1; SELECT 2\",\"sessionId\":\"s-1\",\"autoCommit\":true,\"multiStatementCount\":0}",
+        any,
+    );
+}
+
 test "wire: a control character is escaped rather than emitted raw" {
     const body = try frostlake.wire.encodeRequest(testing.allocator, .{ .sql = "a\x01b" });
     defer testing.allocator.free(body);
@@ -639,6 +684,37 @@ test "wire: a column with no nullable field reads as unknown" {
     var decoded = try frostlake.wire.decodeResponse(testing.allocator, payload, null);
     defer decoded.response.deinit();
     try testing.expectEqual(frostlake.Nullability.unknown, (try decoded.response.first().column(0)).nullable);
+}
+
+test "wire: a text or binary column carries its declared width" {
+    // `length` is sent for VARCHAR and BINARY only — characters for one, bytes for the other —
+    // and an unbounded column carries the most it could hold, so nothing has to be invented.
+    const payload =
+        \\{"success":true,"resultSets":[{"columns":[
+        \\{"name":"V9","dataType":"VARCHAR","precision":0,"scale":0,"length":9},
+        \\{"name":"B5","dataType":"BINARY","precision":0,"scale":0,"length":5},
+        \\{"name":"N","dataType":"NUMBER","precision":10,"scale":2},
+        \\{"name":"VU","dataType":"VARCHAR","precision":0,"scale":0,"length":16777216}],
+        \\"rows":[]}]}
+    ;
+    var decoded = try frostlake.wire.decodeResponse(testing.allocator, payload, null);
+    defer decoded.response.deinit();
+    const set = decoded.response.first();
+    try testing.expectEqual(@as(?i32, 9), (try set.column(0)).length);
+    try testing.expectEqual(@as(?i32, 5), (try set.column(1)).length);
+    // A number has a precision and a scale and no width at all.
+    try testing.expectEqual(@as(?i32, null), (try set.column(2)).length);
+    try testing.expectEqual(@as(i32, 10), (try set.column(2)).precision);
+    try testing.expectEqual(@as(?i32, 16777216), (try set.column(3)).length);
+}
+
+test "wire: a column with no length field reads as null, not zero" {
+    const payload =
+        \\{"success":true,"resultSets":[{"columns":[{"name":"A","dataType":"VARCHAR"}],"rows":[["x"]]}]}
+    ;
+    var decoded = try frostlake.wire.decodeResponse(testing.allocator, payload, null);
+    defer decoded.response.deinit();
+    try testing.expectEqual(@as(?i32, null), (try decoded.response.first().column(0)).length);
 }
 
 test "wire: a failed statement carries the engine's message" {
@@ -982,4 +1058,641 @@ test "session: a closed connection refuses further work" {
     conn.close();
 
     try testing.expect(!conn.isValid());
+}
+
+// ---------------------------------------------------------------------------
+// Session lifetime, over a scripted transport: requireSession once the engine offers it,
+// recovery from the engine's refusal of a lost session, and releasing the session on close
+// ---------------------------------------------------------------------------
+
+/// A transport that answers from a script — one reply per request, in order — and keeps what
+/// every request carried. A request the script has no reply for fails. It outlives the
+/// connection that closes it, so a test can look at what closing sent.
+const ScriptedTransport = struct {
+    allocator: std.mem.Allocator,
+    replies: std.ArrayList(Scripted) = .empty,
+    next_reply: usize = 0,
+    seen: std.ArrayList(Seen) = .empty,
+    /// How a DELETE is answered; it takes no reply from the script.
+    delete_reply: Scripted = released,
+
+    const Scripted = struct { status: u16, body: []const u8 };
+
+    /// One request, as far as the tests care.
+    const Seen = struct {
+        method: []const u8,
+        path: []u8,
+        sql: []u8,
+        session_id: []u8,
+        /// The requireSession field, or null when the request carried none.
+        require_session: ?bool,
+        auto_commit: ?bool,
+    };
+
+    const vtable = frostlake.Transport.VTable{
+        .post = post,
+        .get = get,
+        .baseUrl = baseUrl,
+        .deinit = closeFn,
+        .delete = delete,
+    };
+
+    fn init(allocator: std.mem.Allocator) ScriptedTransport {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *ScriptedTransport) void {
+        for (self.seen.items) |s| {
+            self.allocator.free(s.path);
+            self.allocator.free(s.sql);
+            self.allocator.free(s.session_id);
+        }
+        self.seen.deinit(self.allocator);
+        self.replies.deinit(self.allocator);
+    }
+
+    fn transport(self: *ScriptedTransport) frostlake.Transport {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn reply(self: *ScriptedTransport, replies: []const Scripted) !void {
+        try self.replies.appendSlice(self.allocator, replies);
+    }
+
+    fn pending(self: *const ScriptedTransport) usize {
+        return self.replies.items.len - self.next_reply;
+    }
+
+    fn record(self: *ScriptedTransport, method: []const u8, path: []const u8, body: []const u8) !void {
+        var seen = Seen{
+            .method = method,
+            .path = try self.allocator.dupe(u8, path),
+            .sql = try self.allocator.dupe(u8, ""),
+            .session_id = try self.allocator.dupe(u8, ""),
+            .require_session = null,
+            .auto_commit = null,
+        };
+        if (body.len > 0) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+            defer parsed.deinit();
+            const fields = parsed.value.object;
+            if (fields.get("sql")) |v| {
+                self.allocator.free(seen.sql);
+                seen.sql = try self.allocator.dupe(u8, v.string);
+            }
+            if (fields.get("sessionId")) |v| {
+                self.allocator.free(seen.session_id);
+                seen.session_id = try self.allocator.dupe(u8, v.string);
+            }
+            if (fields.get("requireSession")) |v| seen.require_session = v.bool;
+            if (fields.get("autoCommit")) |v| seen.auto_commit = v.bool;
+        }
+        try self.seen.append(self.allocator, seen);
+    }
+
+    fn post(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        body: []const u8,
+        diag: ?*frostlake.Diagnostics,
+    ) frostlake.Error!frostlake.RawReply {
+        _ = diag;
+        const self: *ScriptedTransport = @ptrCast(@alignCast(ptr));
+        self.record("POST", path, body) catch return frostlake.Error.TransportFailed;
+        if (self.next_reply >= self.replies.items.len) {
+            std.debug.print("unscripted request: {s}\n", .{body});
+            return frostlake.Error.TransportFailed;
+        }
+        const next = self.replies.items[self.next_reply];
+        self.next_reply += 1;
+        return .{ .status = next.status, .body = try allocator.dupe(u8, next.body) };
+    }
+
+    fn get(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        diag: ?*frostlake.Diagnostics,
+    ) frostlake.Error!frostlake.RawReply {
+        _ = ptr;
+        _ = path;
+        _ = diag;
+        return .{ .status = 200, .body = try allocator.dupe(u8, "{\"status\":\"healthy\"}") };
+    }
+
+    fn baseUrl(ptr: *anyopaque) []const u8 {
+        _ = ptr;
+        return "http://scripted";
+    }
+
+    /// The connection is done with the transport; the test frees it.
+    fn closeFn(ptr: *anyopaque) void {
+        _ = ptr;
+    }
+
+    fn delete(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        timeout_ms: u64,
+    ) frostlake.Error!frostlake.RawReply {
+        _ = timeout_ms;
+        const self: *ScriptedTransport = @ptrCast(@alignCast(ptr));
+        self.record("DELETE", path, "") catch return frostlake.Error.TransportFailed;
+        return .{ .status = self.delete_reply.status, .body = try allocator.dupe(u8, self.delete_reply.body) };
+    }
+
+    /// The SQL of every POST so far.
+    fn statements(self: *const ScriptedTransport, allocator: std.mem.Allocator) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        for (self.seen.items) |s| {
+            if (std.mem.eql(u8, s.method, "POST")) try out.append(allocator, s.sql);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn deletes(self: *const ScriptedTransport) usize {
+        var n: usize = 0;
+        for (self.seen.items) |s| {
+            if (std.mem.eql(u8, s.method, "DELETE")) n += 1;
+        }
+        return n;
+    }
+};
+
+/// An engine that reports newSession (0.1.0 and later) answering with no result set.
+fn answer(comptime id: []const u8, comptime fresh: bool) ScriptedTransport.Scripted {
+    return .{ .status = 200, .body = "{\"success\":true,\"sessionId\":\"" ++ id ++ "\",\"newSession\":" ++
+        (if (fresh) "true" else "false") ++ ",\"errorMessage\":null,\"resultSets\":[]}" };
+}
+
+/// The same, carrying one NUMBER column N holding `value`.
+fn answerNumber(comptime id: []const u8, comptime value: i64) ScriptedTransport.Scripted {
+    return .{ .status = 200, .body = std.fmt.comptimePrint(
+        "{{\"success\":true,\"sessionId\":\"{s}\",\"newSession\":false,\"errorMessage\":null,\"resultSets\":[{{\"columns\":[{{\"name\":\"N\",\"dataType\":\"NUMBER\",\"precision\":38,\"scale\":0}}],\"rows\":[[{d}]],\"rowCount\":1}}]}}",
+        .{ id, value },
+    ) };
+}
+
+/// An engine that predates newSession (0.0.7) answering.
+fn legacy(comptime id: []const u8) ScriptedTransport.Scripted {
+    return .{ .status = 200, .body = "{\"success\":true,\"sessionId\":\"" ++ id ++ "\",\"errorMessage\":null,\"resultSets\":[]}" };
+}
+
+/// The 404 a requireSession request gets when its session is gone.
+fn gone(comptime id: []const u8) ScriptedTransport.Scripted {
+    return .{ .status = 404, .body = "{\"success\":false,\"sessionId\":null,\"newSession\":false,\"errorMessage\":\"Session '" ++
+        id ++ "' does not exist or has expired.\",\"resultSets\":[]}" };
+}
+
+/// The engine's answer to DELETE /api/sessions/{id}.
+const released: ScriptedTransport.Scripted = .{ .status = 200, .body = "{\"success\":true,\"sessionId\":null,\"newSession\":false,\"errorMessage\":null,\"resultSets\":[]}" };
+
+const scoped_dsn = "frostlake://h:1/APP?schema=PUBLIC";
+
+/// A connection over `script` to an engine that reports newSession, holding session s1 on the
+/// DSN's scope after one statement.
+fn openedOn(script: *ScriptedTransport) !frostlake.Connection {
+    const config = try frostlake.parseDsn(testing.allocator, scoped_dsn, null);
+    var conn = try frostlake.Connection.openWithTransport(testing.allocator, testing.io, config, script.transport());
+    errdefer conn.close();
+    try script.reply(&.{ answer("s1", true), answer("s1", false), answer("s1", false) });
+    var response = try conn.query("SELECT 0", &.{});
+    response.deinit();
+    return conn;
+}
+
+fn run(conn: *frostlake.Connection, statement: []const u8) !void {
+    var response = try conn.query(statement, &.{});
+    response.deinit();
+}
+
+fn expectStatements(script: *const ScriptedTransport, from: usize, want: []const []const u8) !void {
+    const got = try script.statements(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expect(got.len >= from);
+    try testing.expectEqual(want.len, got.len - from);
+    for (want, got[from..]) |w, g| try testing.expectEqualStrings(w, g);
+}
+
+fn expectLost(conn: *const frostlake.Connection, wording: []const u8) !void {
+    if (std.mem.indexOf(u8, conn.lastError(), wording) == null) {
+        std.debug.print("lastError \"{s}\" does not mention \"{s}\"\n", .{ conn.lastError(), wording });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "session lifetime: requireSession follows the first answer" {
+    var script = ScriptedTransport.init(testing.allocator);
+    defer script.deinit();
+    var conn = try openedOn(&script);
+    defer conn.close();
+    try script.reply(&.{answer("s1", false)});
+    try run(&conn, "SELECT 1");
+
+    try expectStatements(&script, 0, &.{ "USE DATABASE APP", "USE SCHEMA PUBLIC", "SELECT 0", "SELECT 1" });
+    const seen = script.seen.items;
+    // The first request names no session, so there is nothing to require yet.
+    try testing.expectEqualStrings("", seen[0].session_id);
+    try testing.expectEqual(@as(?bool, null), seen[0].require_session);
+    // The first answer says the engine offers it; every request naming the session carries it.
+    for (seen[1..]) |s| {
+        try testing.expectEqualStrings("s1", s.session_id);
+        try testing.expectEqual(@as(?bool, true), s.require_session);
+    }
+}
+
+test "session lifetime: an older engine is sent neither requireSession nor a release" {
+    var script = ScriptedTransport.init(testing.allocator);
+    defer script.deinit();
+    const config = try frostlake.parseDsn(testing.allocator, scoped_dsn, null);
+    var conn = try frostlake.Connection.openWithTransport(testing.allocator, testing.io, config, script.transport());
+    try script.reply(&.{ legacy("old1"), legacy("old1"), legacy("old1"), legacy("old1") });
+    try run(&conn, "SELECT 1");
+    try run(&conn, "SELECT 2");
+    conn.close();
+    // Its parser may refuse a field it does not know, and it has no release endpoint.
+    for (script.seen.items) |s| try testing.expectEqual(@as(?bool, null), s.require_session);
+    try testing.expectEqual(@as(usize, 0), script.deletes());
+    try testing.expectEqual(@as(usize, 4), script.seen.items.len);
+}
+
+test "session lifetime: a lost session is replaced and the statement sent once more" {
+    var script = ScriptedTransport.init(testing.allocator);
+    defer script.deinit();
+    var conn = try openedOn(&script);
+    defer conn.close();
+    try script.reply(&.{ gone("s1"), answer("s2", true), answer("s2", false), answerNumber("s2", 2) });
+    var response = try conn.query("SELECT 2 AS N", &.{});
+    defer response.deinit();
+    try testing.expectEqual(@as(i64, 2), try (try response.scalar()).asInt());
+
+    try expectStatements(&script, 3, &.{ "SELECT 2 AS N", "USE DATABASE APP", "USE SCHEMA PUBLIC", "SELECT 2 AS N" });
+    const seen = script.seen.items;
+    // The scope goes onto a fresh session, and the statement follows it there.
+    try testing.expectEqualStrings("", seen[4].session_id);
+    try testing.expectEqualStrings("s2", seen[6].session_id);
+    try testing.expectEqual(@as(?bool, true), seen[6].require_session);
+    try testing.expectEqualStrings("s2", conn.session_id);
+    try testing.expectEqual(@as(usize, 0), script.pending());
+}
+
+test "session lifetime: a second refusal is reported and the connection carries on" {
+    var script = ScriptedTransport.init(testing.allocator);
+    defer script.deinit();
+    var conn = try openedOn(&script);
+    defer conn.close();
+    try script.reply(&.{ gone("s1"), answer("s2", true), answer("s2", false), gone("s2") });
+    try testing.expectError(frostlake.Error.SessionLost, conn.query("SELECT 2", &.{}));
+    try expectLost(&conn, "just started");
+    // Sent once more, never twice.
+    try expectStatements(&script, 3, &.{ "SELECT 2", "USE DATABASE APP", "USE SCHEMA PUBLIC", "SELECT 2" });
+
+    try script.reply(&.{ answer("s3", true), answer("s3", false), answer("s3", false) });
+    try run(&conn, "SELECT 3");
+    const seen = script.seen.items;
+    try testing.expectEqualStrings("", seen[seen.len - 3].session_id);
+    try testing.expectEqual(@as(usize, 0), script.pending());
+}
+
+const TransactionEnd = enum { commit, rollback };
+
+fn expectLostTransaction(end: TransactionEnd) !void {
+    var script = ScriptedTransport.init(testing.allocator);
+    defer script.deinit();
+    var conn = try openedOn(&script);
+    defer conn.close();
+    try script.reply(&.{ answer("s1", false), gone("s1") });
+    try conn.begin();
+    try testing.expectError(frostlake.Error.SessionLost, conn.exec("INSERT INTO T VALUES (1)", &.{}));
+    try expectLost(&conn, "transaction");
+
+    // The transaction stays refused until it is ended: nothing more is sent for it, no other
+    // transaction starts over it, and it cannot be committed.
+    const before = script.seen.items.len;
+    try testing.expectError(frostlake.Error.SessionLost, conn.exec("INSERT INTO T VALUES (2)", &.{}));
+    try testing.expectError(frostlake.Error.InvalidTransactionState, conn.begin());
+    switch (end) {
+        .commit => {
+            try testing.expectError(frostlake.Error.SessionLost, conn.commit());
+            try expectLost(&conn, "nothing was committed");
+        },
+        .rollback => try conn.rollback(),
+    }
+    try testing.expectEqual(before, script.seen.items.len);
+    try expectStatements(&script, 3, &.{ "BEGIN", "INSERT INTO T VALUES (1)" });
+
+    // The connection stays usable: a fresh session on the DSN's scope, outside any transaction.
+    try script.reply(&.{ answer("s2", true), answer("s2", false), answer("s2", false) });
+    try run(&conn, "SELECT 1");
+    const last = script.seen.items[script.seen.items.len - 1];
+    try testing.expectEqualStrings("s2", last.session_id);
+    try testing.expectEqual(@as(?bool, true), last.auto_commit);
+    try testing.expect(conn.isValid());
+}
+
+test "session lifetime: a lost transaction is reported, not replaced, and commit cannot succeed" {
+    try expectLostTransaction(.commit);
+}
+
+test "session lifetime: a lost transaction is reported, not replaced, and rollback ends it" {
+    try expectLostTransaction(.rollback);
+}
+
+test "session lifetime: a transaction begun as a statement is tracked, and its loss reported" {
+    var script = ScriptedTransport.init(testing.allocator);
+    defer script.deinit();
+    var conn = try openedOn(&script);
+    defer conn.close();
+    try script.reply(&.{ answer("s1", false), gone("s1") });
+    try run(&conn, "BEGIN TRANSACTION");
+    try testing.expectError(frostlake.Error.InvalidTransactionState, conn.begin());
+    try testing.expectError(frostlake.Error.SessionLost, conn.exec("INSERT INTO T VALUES (1)", &.{}));
+    try expectLost(&conn, "transaction");
+    try script.reply(&.{ answer("s2", true), answer("s2", false), answer("s2", false) });
+    try run(&conn, "SELECT 1");
+    try expectStatements(&script, 3, &.{ "BEGIN TRANSACTION", "INSERT INTO T VALUES (1)", "USE DATABASE APP", "USE SCHEMA PUBLIC", "SELECT 1" });
+}
+
+test "session lifetime: a lost context is reported, not replaced" {
+    const statements = [_][]const u8{
+        "USE SCHEMA OTHER",
+        "SET v = 1",
+        "UNSET v",
+        "ALTER SESSION SET TIMEZONE = 'UTC'",
+        "CREATE TEMPORARY TABLE tt (a INT)",
+        "CREATE OR REPLACE DATABASE d2",
+        "DROP SCHEMA IF EXISTS s2",
+        "SELECT 1; USE SCHEMA OTHER",
+    };
+    for (statements) |statement| {
+        var script = ScriptedTransport.init(testing.allocator);
+        defer script.deinit();
+        var conn = try openedOn(&script);
+        defer conn.close();
+        try script.reply(&.{ answer("s1", false), gone("s1") });
+        var moved = try conn.queryWith(statement, &.{}, .{ .multi_statement_count = 0 });
+        moved.deinit();
+        try testing.expectError(frostlake.Error.SessionLost, conn.query("SELECT * FROM T", &.{}));
+        try expectLost(&conn, "context");
+        // Reported, not re-run somewhere else.
+        try expectStatements(&script, 3, &.{ statement, "SELECT * FROM T" });
+    }
+}
+
+test "session lifetime: ordinary DDL leaves a session that is replaced when lost" {
+    var script = ScriptedTransport.init(testing.allocator);
+    defer script.deinit();
+    var conn = try openedOn(&script);
+    defer conn.close();
+    try script.reply(&.{ answer("s1", false), gone("s1"), answer("s2", true), answer("s2", false), answer("s2", false) });
+    try run(&conn, "CREATE OR REPLACE TABLE T (a INT)");
+    try run(&conn, "INSERT INTO T VALUES (1)");
+    try testing.expectEqual(@as(usize, 0), script.pending());
+}
+
+test "session lifetime: a replaced session gets the scope back before the next statement" {
+    var script = ScriptedTransport.init(testing.allocator);
+    defer script.deinit();
+    const config = try frostlake.parseDsn(testing.allocator, scoped_dsn, null);
+    var conn = try frostlake.Connection.openWithTransport(testing.allocator, testing.io, config, script.transport());
+    defer conn.close();
+    try script.reply(&.{ legacy("s1"), legacy("s1"), legacy("s1") });
+    try run(&conn, "SELECT 0");
+    // Not asked to require it, an engine that no longer holds the session runs the statement in
+    // a fresh one under the same id, and says so.
+    try script.reply(&.{ answer("s1", true), answer("s1", false), answer("s1", false), answer("s1", false) });
+    try run(&conn, "SELECT 1");
+    try run(&conn, "SELECT 2");
+    try expectStatements(&script, 0, &.{ "USE DATABASE APP", "USE SCHEMA PUBLIC", "SELECT 0", "SELECT 1", "USE DATABASE APP", "USE SCHEMA PUBLIC", "SELECT 2" });
+    try testing.expectEqual(@as(?bool, true), script.seen.items[script.seen.items.len - 1].require_session);
+}
+
+test "session lifetime: closing releases the session once" {
+    var script = ScriptedTransport.init(testing.allocator);
+    defer script.deinit();
+    var conn = try openedOn(&script);
+    conn.close();
+    try testing.expectEqual(@as(usize, 1), script.deletes());
+    const last = script.seen.items[script.seen.items.len - 1];
+    try testing.expectEqualStrings("DELETE", last.method);
+    try testing.expectEqualStrings("/api/sessions/s1", last.path);
+    conn.close();
+    try testing.expectEqual(@as(usize, 1), script.deletes());
+}
+
+test "session lifetime: a connection that never ran a statement releases nothing" {
+    var script = ScriptedTransport.init(testing.allocator);
+    defer script.deinit();
+    const config = try frostlake.parseDsn(testing.allocator, scoped_dsn, null);
+    var conn = try frostlake.Connection.openWithTransport(testing.allocator, testing.io, config, script.transport());
+    conn.close();
+    try testing.expectEqual(@as(usize, 0), script.seen.items.len);
+}
+
+test "session lifetime: an idle connection re-applies its scope only against an older engine" {
+    const cases = [_]struct { fresh: ScriptedTransport.Scripted, then: ScriptedTransport.Scripted, rescoped: bool }{
+        .{ .fresh = answer("s1", true), .then = answer("s1", false), .rescoped = false },
+        .{ .fresh = legacy("s1"), .then = legacy("s1"), .rescoped = true },
+    };
+    for (cases) |case| {
+        var script = ScriptedTransport.init(testing.allocator);
+        defer script.deinit();
+        const config = try frostlake.parseDsn(testing.allocator, scoped_dsn, null);
+        var conn = try frostlake.Connection.openWithTransport(testing.allocator, testing.io, config, script.transport());
+        defer conn.close();
+        try script.reply(&.{ case.fresh, case.then, case.then, case.then, case.then, case.then });
+        try run(&conn, "SELECT 0");
+        const now = std.Io.Timestamp.now(testing.io, .awake);
+        conn.last_activity = .{ .nanoseconds = now.nanoseconds - 10 * std.time.ns_per_min };
+        try run(&conn, "SELECT 1");
+        if (case.rescoped) {
+            try expectStatements(&script, 3, &.{ "USE DATABASE APP", "USE SCHEMA PUBLIC", "SELECT 1" });
+        } else {
+            try expectStatements(&script, 3, &.{"SELECT 1"});
+        }
+    }
+}
+
+test "session lifetime: statements that leave context behind are recognised" {
+    const touching = [_][]const u8{
+        "USE DATABASE x",                  "use schema y",                   "USE ROLE r",
+        "SET v = 1",                       "UNSET v",                        "ALTER SESSION SET TIMEZONE = 'UTC'",
+        "alter session unset timezone",    "CREATE DATABASE d",              "CREATE OR REPLACE DATABASE d",
+        "CREATE TRANSIENT DATABASE d",     "DROP DATABASE IF EXISTS d",      "CREATE SCHEMA IF NOT EXISTS s",
+        "DROP SCHEMA s",                   "CREATE TEMPORARY TABLE t (a INT)", "CREATE OR REPLACE TEMP TABLE t (a INT)",
+        "CREATE VOLATILE TABLE t (a INT)", "CREATE TEMPORARY STAGE st",      "  -- comment\n  USE DATABASE x",
+        "/* c */ SET v = 1",
+    };
+    for (touching) |statement| {
+        if (!frostlake.sql.touchesSession(statement)) {
+            std.debug.print("not recognised: {s}\n", .{statement});
+            return error.TestUnexpectedResult;
+        }
+    }
+    const untouched = [_][]const u8{
+        "SELECT 1",                         "INSERT INTO t VALUES (1)", "UPDATE t SET a = 1",
+        "CREATE TABLE t (a INT)",           "CREATE OR REPLACE TABLE t (a INT)", "DROP TABLE t",
+        "DROP TEMPORARY TABLE t",           "CREATE VIEW v AS SELECT 1", "ALTER TABLE t ADD COLUMN b INT",
+        "CREATE OR REPLACE FUNCTION f() RETURNS INT AS $$ 1 $$", "BEGIN", "COMMIT",
+        "SELECT 'USE DATABASE x'",          "",                         "   ",
+    };
+    for (untouched) |statement| {
+        if (frostlake.sql.touchesSession(statement)) {
+            std.debug.print("wrongly recognised: {s}\n", .{statement});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "session lifetime: transaction boundaries are recognised" {
+    const cases = [_]struct { []const u8, frostlake.sql.TransactionEffect }{
+        .{ "BEGIN", .begins },               .{ "begin transaction", .begins },
+        .{ "BEGIN WORK", .begins },          .{ "BEGIN NAME t1", .begins },
+        .{ "START TRANSACTION", .begins },   .{ "  -- open\n BEGIN", .begins },
+        .{ "COMMIT", .ends },                .{ "commit work", .ends },
+        .{ "ROLLBACK", .ends },              .{ "SELECT 1", .none },
+        .{ "", .none },                      .{ "START", .none },
+        // BEGIN followed by a statement opens a scripting block, not a transaction.
+        .{ "BEGIN SELECT 1", .none },        .{ "BEGIN\n  LET x := 1", .none },
+    };
+    for (cases) |case| {
+        if (frostlake.sql.transactionEffect(case[0]) != case[1]) {
+            std.debug.print("{s}: {t}, want {t}\n", .{ case[0], frostlake.sql.transactionEffect(case[0]), case[1] });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Releasing a session over real sockets, against a loopback server that answers badly
+// ---------------------------------------------------------------------------
+
+/// A loopback HTTP server answering one connection per scripted reply, in order: it reads the
+/// request whole, then answers it (`Connection: close`, so every request arrives on a
+/// connection of its own), drops the connection unanswered, or holds it unanswered until the
+/// test stops the server. It keeps each request's first line.
+const LoopbackServer = struct {
+    server: std.Io.net.Server,
+    replies: []const Reply,
+    lines: std.ArrayList([]u8) = .empty,
+    stop: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    const Reply = union(enum) {
+        answer: struct { status: u16, body: []const u8 },
+        drop,
+        hang,
+    };
+
+    fn start(self: *LoopbackServer, replies: []const Reply) !void {
+        const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        self.* = .{ .server = try address.listen(testing.io, .{}), .replies = replies };
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    fn port(self: *const LoopbackServer) u16 {
+        return self.server.socket.address.getPort();
+    }
+
+    /// Stop serving: let a held connection go, wake an accept still waiting, and join.
+    fn finish(self: *LoopbackServer) void {
+        self.stop.store(true, .release);
+        const address = std.Io.net.IpAddress.parseIp4("127.0.0.1", self.port()) catch unreachable;
+        if (address.connect(testing.io, .{ .mode = .stream })) |wake| {
+            wake.close(testing.io);
+        } else |_| {}
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+    }
+
+    fn deinit(self: *LoopbackServer) void {
+        if (self.thread != null) self.finish();
+        for (self.lines.items) |line| testing.allocator.free(line);
+        self.lines.deinit(testing.allocator);
+        self.server.deinit(testing.io);
+    }
+
+    fn serve(self: *LoopbackServer) void {
+        for (self.replies) |reply| {
+            const stream = self.server.accept(testing.io) catch return;
+            defer stream.close(testing.io);
+            if (self.stop.load(.acquire)) return;
+            var read_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(testing.io, &read_buffer);
+            const line = readRequest(&reader.interface) catch return;
+            self.lines.append(testing.allocator, line) catch {
+                testing.allocator.free(line);
+                return;
+            };
+            switch (reply) {
+                .answer => |a| {
+                    var write_buffer: [1024]u8 = undefined;
+                    var writer = stream.writer(testing.io, &write_buffer);
+                    writer.interface.print(
+                        "HTTP/1.1 {d} X\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+                        .{ a.status, a.body.len, a.body },
+                    ) catch return;
+                    writer.interface.flush() catch return;
+                },
+                .drop => {},
+                .hang => while (!self.stop.load(.acquire)) {
+                    std.Io.sleep(testing.io, .fromMilliseconds(10), .awake) catch return;
+                },
+            }
+        }
+    }
+
+    /// Read one request, head and body, and hand back its first line.
+    fn readRequest(reader: *std.Io.Reader) ![]u8 {
+        const first = try reader.takeDelimiterInclusive('\n');
+        const line = try testing.allocator.dupe(u8, std.mem.trimEnd(u8, first, "\r\n"));
+        errdefer testing.allocator.free(line);
+        var length: usize = 0;
+        while (true) {
+            const header = std.mem.trimEnd(u8, try reader.takeDelimiterInclusive('\n'), "\r\n");
+            if (header.len == 0) break;
+            if (std.ascii.startsWithIgnoreCase(header, "content-length:")) {
+                length = std.fmt.parseInt(usize, std.mem.trim(u8, header["content-length:".len..], " "), 10) catch 0;
+            }
+        }
+        try reader.discardAll(length);
+        return line;
+    }
+};
+
+test "session lifetime: closing never fails whatever the release meets" {
+    const statement_answer: LoopbackServer.Reply = .{ .answer = .{ .status = 200, .body = answer("s1", true).body } };
+    const cases = [_]struct { name: []const u8, release: LoopbackServer.Reply }{
+        .{ .name = "released", .release = .{ .answer = .{ .status = 200, .body = released.body } } },
+        .{ .name = "unknown session", .release = .{ .answer = .{ .status = 404, .body = "{\"success\":false,\"sessionId\":null}" } } },
+        .{ .name = "method not allowed", .release = .{ .answer = .{ .status = 405, .body = "{\"error\":\"Method not allowed\"}" } } },
+        .{ .name = "not a Frostlake answer", .release = .{ .answer = .{ .status = 502, .body = "<html>Bad Gateway</html>" } } },
+        .{ .name = "closed socket", .release = .drop },
+        .{ .name = "no answer", .release = .hang },
+    };
+    for (cases) |case| {
+        const replies = [_]LoopbackServer.Reply{ statement_answer, case.release };
+        var loopback: LoopbackServer = undefined;
+        try loopback.start(&replies);
+        defer loopback.deinit();
+
+        const dsn = try std.fmt.allocPrint(testing.allocator, "frostlake://127.0.0.1:{d}?timeout=300ms", .{loopback.port()});
+        defer testing.allocator.free(dsn);
+        var conn = try frostlake.Connection.open(testing.allocator, testing.io, dsn);
+        try run(&conn, "SELECT 1");
+        const started = std.Io.Timestamp.now(testing.io, .awake);
+        conn.close();
+        const took = started.durationTo(std.Io.Timestamp.now(testing.io, .awake));
+        loopback.finish();
+
+        if (took.nanoseconds > 3 * std.time.ns_per_s) {
+            std.debug.print("{s}: closing took {d} ms\n", .{ case.name, @divTrunc(took.nanoseconds, std.time.ns_per_ms) });
+            return error.TestUnexpectedResult;
+        }
+        // One statement, then exactly one release.
+        try testing.expectEqual(@as(usize, 2), loopback.lines.items.len);
+        try testing.expectEqualStrings("DELETE /api/sessions/s1 HTTP/1.1", loopback.lines.items[1]);
+    }
 }

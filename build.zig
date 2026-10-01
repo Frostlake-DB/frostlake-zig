@@ -45,37 +45,31 @@ pub fn build(b: *std.Build) void {
     // change without a single source file changing.
     run_integration_tests.has_side_effects = true;
 
-    const integration_step = b.step("test-integration", "Run the integration tests against a running engine");
-    integration_step.dependOn(&run_integration_tests.step);
+    // The engine's testkit corpus, replayed through the driver against the same engine. It runs
+    // only when FL_CORPUS names the frostlake repo's testkit directory, and skips otherwise.
+    // `zig build test-suites` runs it alone, and the integration run includes it.
+    const suite_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/suites.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "frostlake", .module = frostlake }},
+        }),
+    });
+    const run_suite_tests = b.addRunArtifact(suite_tests);
+    run_suite_tests.has_side_effects = true;
 
-    // tests/suites.zig is not part of the package yet: where a checkout has it, `test-suites`
-    // runs it and `test-all` includes it.
-    const has_suites = if (b.build_root.handle.access(b.graph.io, "tests/suites.zig", .{})) |_| true else |_| false;
+    const suites_step = b.step("test-suites", "Run the engine's JSON testkit suites through this driver");
+    suites_step.dependOn(&run_suite_tests.step);
+
+    const integration_step = b.step("test-integration", "Run the integration tests and the testkit corpus against a running engine");
+    integration_step.dependOn(&run_integration_tests.step);
+    integration_step.dependOn(&run_suite_tests.step);
 
     // Everything at once.
-    const all_step = b.step("test-all", if (has_suites)
-        "Run unit, integration and testkit suites"
-    else
-        "Run the unit and integration tests");
+    const all_step = b.step("test-all", "Run unit, integration and testkit suites");
     all_step.dependOn(test_step);
     all_step.dependOn(integration_step);
-
-    if (has_suites) {
-        const suite_tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tests/suites.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{.{ .name = "frostlake", .module = frostlake }},
-            }),
-        });
-        const run_suite_tests = b.addRunArtifact(suite_tests);
-        run_suite_tests.has_side_effects = true;
-
-        const suites_step = b.step("test-suites", "Run the engine's JSON testkit suites through this driver");
-        suites_step.dependOn(&run_suite_tests.step);
-        all_step.dependOn(suites_step);
-    }
 
     // A worked example, built and runnable with `zig build example`.
     const example = b.addExecutable(.{

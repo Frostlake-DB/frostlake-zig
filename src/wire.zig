@@ -1,7 +1,8 @@
 //! The JSON on the wire.
 //!
-//! `POST /api/execute` takes `{"sql":…,"sessionId":…,"autoCommit":…}` and answers with
-//! `{"success":…,"sessionId":…,"errorMessage":…,"resultSets":[…],"executionTimeMs":…}`.
+//! `POST /api/execute` takes `{"sql":…,"sessionId":…,"requireSession":…,"autoCommit":…,
+//! "multiStatementCount":…}` and answers with `{"success":…,"sessionId":…,"newSession":…,
+//! "errorMessage":…,"resultSets":[…],"executionTimeMs":…}`.
 //!
 //! The response is read with `std.json`'s token scanner rather than its dynamic tree, for one
 //! reason: the scanner hands back a number's text exactly as it appeared. A `NUMBER(38,0)` and
@@ -26,7 +27,14 @@ const Error = diag_mod.Error;
 pub const Request = struct {
     sql: []const u8,
     session_id: []const u8 = "",
+    /// Ask the engine to refuse (404) rather than start a fresh session under an id it no
+    /// longer holds. Only meaningful with a session id, and only sent to an engine known to
+    /// honour it: an older one's parser may refuse a field it does not know.
+    require_session: bool = false,
     auto_commit: bool = true,
+    /// How many statements this one request carries, or null to leave the field out of the body
+    /// and the session's `MULTI_STATEMENT_COUNT` in charge of it. `0` means any number.
+    multi_statement_count: ?u32 = null,
 };
 
 /// Render a request body.
@@ -40,9 +48,14 @@ pub fn encodeRequest(allocator: Allocator, request: Request) Allocator.Error![]u
     if (request.session_id.len > 0) {
         writer.writeAll(",\"sessionId\":") catch return error.OutOfMemory;
         writeJsonString(writer, request.session_id) catch return error.OutOfMemory;
+        if (request.require_session) writer.writeAll(",\"requireSession\":true") catch return error.OutOfMemory;
     }
-    writer.writeAll(if (request.auto_commit) ",\"autoCommit\":true}" else ",\"autoCommit\":false}") catch
+    writer.writeAll(if (request.auto_commit) ",\"autoCommit\":true" else ",\"autoCommit\":false") catch
         return error.OutOfMemory;
+    if (request.multi_statement_count) |count| {
+        writer.print(",\"multiStatementCount\":{d}", .{count}) catch return error.OutOfMemory;
+    }
+    writer.writeAll("}") catch return error.OutOfMemory;
 
     return out.toOwnedSlice();
 }
@@ -76,6 +89,10 @@ pub const Decoded = struct {
     success: bool = false,
     /// Borrowed from the response's arena.
     session_id: []const u8 = "",
+    /// Whether the request ran in a session started for it; null from an engine that predates
+    /// the field, which is also one that has neither `requireSession` nor
+    /// `DELETE /api/sessions/{id}`.
+    new_session: ?bool = null,
     error_message: []const u8 = "",
 };
 
@@ -176,6 +193,8 @@ pub fn decodeResponse(allocator: Allocator, body: []const u8, diag: ?*Diagnostic
             saw_success_field = true;
         } else if (std.mem.eql(u8, key, "sessionId")) {
             decoded.session_id = (try readOptionalString(&scanner, gpa)) orelse "";
+        } else if (std.mem.eql(u8, key, "newSession")) {
+            decoded.new_session = try readBool(&scanner, gpa);
         } else if (std.mem.eql(u8, key, "errorMessage")) {
             decoded.error_message = (try readOptionalString(&scanner, gpa)) orelse "";
         } else if (std.mem.eql(u8, key, "error")) {
@@ -340,6 +359,11 @@ fn readColumns(
             } else if (std.mem.eql(u8, key, "scale")) {
                 const text = (try readNumberText(scanner, gpa)) orelse "";
                 column.scale = std.fmt.parseInt(i32, text, 10) catch 0;
+            } else if (std.mem.eql(u8, key, "length")) {
+                // Sent for text and binary columns only, so absent means the column has no
+                // width to report — kept apart from a width of zero, which is never sent.
+                const text = (try readNumberText(scanner, gpa)) orelse "";
+                column.length = std.fmt.parseInt(i32, text, 10) catch null;
             } else if (std.mem.eql(u8, key, "nullable")) {
                 // The field means "known to accept NULL" and is always sent by an engine that
                 // has it; absent or null therefore means exactly one thing — a server

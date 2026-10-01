@@ -254,8 +254,11 @@ pub fn renderString(writer: anytype, text: []const u8) !void {
 /// Render a float so the parser reads back the value that was bound.
 ///
 /// The special values need spelling out: written bare, `nan` and `inf` reach the parser as
-/// identifiers and the statement fails on a name it cannot resolve. A whole number gets a
-/// `.0` so the literal keeps its floating type rather than binding as an integer.
+/// identifiers and the statement fails on a name it cannot resolve. Every finite value carries an
+/// explicit `::FLOAT`, because a bare numeral is fixed-point: the account types `1.5` as
+/// NUMBER(2,1) and `2.0` as NUMBER(1,0), the same type the integer 2 gets, and an exponent does not
+/// change that either — `1.5e0` is NUMBER(2,1) too. Only the cast makes it FLOAT, which is what
+/// Snowflake's own driver produces for a bound double.
 fn renderFloat(writer: anytype, v: f64) !void {
     if (std.math.isNan(v)) {
         try writer.writeAll("'NaN'::FLOAT");
@@ -277,13 +280,10 @@ fn renderFloat(writer: anytype, v: f64) !void {
     var buffer: [64]u8 = undefined;
     if (std.fmt.bufPrint(&buffer, "{d}", .{v})) |rendered| {
         try writer.writeAll(rendered);
-        // `{d}` prints 2.0 as "2"; without a fractional part the literal would bind as an
-        // integer, so a bound 2.0 and a bound 2 would become the same value with different
-        // types.
-        if (std.mem.indexOfAny(u8, rendered, ".eEnN") == null) try writer.writeAll(".0");
     } else |_| {
         try writer.print("{d}", .{v});
     }
+    try writer.writeAll("::FLOAT");
     if (negative) try writer.writeByte(')');
 }
 

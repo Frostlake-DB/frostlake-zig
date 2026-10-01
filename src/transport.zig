@@ -50,6 +50,16 @@ pub const Transport = struct {
         baseUrl: *const fn (ptr: *anyopaque) []const u8,
 
         deinit: *const fn (ptr: *anyopaque) void,
+
+        /// DELETE `path`, giving up once `timeout_ms` has passed, connecting included. Null in
+        /// a transport that sends none, which leaves an engine session to the engine's own idle
+        /// sweep when its connection closes.
+        delete: ?*const fn (
+            ptr: *anyopaque,
+            allocator: Allocator,
+            path: []const u8,
+            timeout_ms: u64,
+        ) Error!RawReply = null,
     };
 
     pub fn post(
@@ -68,6 +78,17 @@ pub const Transport = struct {
 
     pub fn baseUrl(self: Transport) []const u8 {
         return self.vtable.baseUrl(self.ptr);
+    }
+
+    /// Whether this transport can send a DELETE at all.
+    pub fn canDelete(self: Transport) bool {
+        return self.vtable.delete != null;
+    }
+
+    /// DELETE `path`, bounded by `timeout_ms` in all.
+    pub fn delete(self: Transport, allocator: Allocator, path: []const u8, timeout_ms: u64) Error!RawReply {
+        const send = self.vtable.delete orelse return Error.TransportFailed;
+        return send(self.ptr, allocator, path, timeout_ms);
     }
 
     pub fn deinit(self: Transport) void {

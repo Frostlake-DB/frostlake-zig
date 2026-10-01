@@ -49,6 +49,11 @@ pub const Column = struct {
     data_type: []const u8,
     precision: i32 = 0,
     scale: i32 = 0,
+    /// The declared width of a text or binary column — characters for `VARCHAR`, bytes for
+    /// `BINARY` — and `null` for every other type, which has none. An unbounded column carries
+    /// the most it could hold rather than nothing, so this needs no fallback; `null` means the
+    /// server said nothing, which a server predating the field also does.
+    length: ?i32 = null,
     nullable: Nullability = .unknown,
 
     pub fn kind(self: Column) ColumnKind {

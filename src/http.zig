@@ -42,6 +42,7 @@ pub const Client = struct {
         .get = getThunk,
         .baseUrl = baseUrlThunk,
         .deinit = deinitThunk,
+        .delete = deleteThunk,
     };
 
     /// Build a client for `base_url`.
@@ -113,6 +114,47 @@ pub const Client = struct {
     fn baseUrlThunk(ptr: *anyopaque) []const u8 {
         const self: *Client = @ptrCast(@alignCast(ptr));
         return self.base_url;
+    }
+
+    fn deleteThunk(ptr: *anyopaque, allocator: Allocator, path: []const u8, timeout_ms: u64) Error!RawReply {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.deleteWithin(allocator, path, timeout_ms);
+    }
+
+    /// How a bounded request ends: answered, or overtaken by its timer.
+    const Race = union(enum) {
+        answered: Error!RawReply,
+        expired: Io.Cancelable!void,
+    };
+
+    /// DELETE `path`, bounded as a whole by `timeout_ms`.
+    ///
+    /// `send` bounds nothing but connecting, and Zig 0.16's threaded I/O cannot bound even
+    /// that, so the request runs as a task of its own raced against a timer, and whichever
+    /// loses is cancelled. An `Io` with no unit of concurrency to spare sends it unbounded.
+    fn deleteWithin(self: *Client, allocator: Allocator, path: []const u8, timeout_ms: u64) Error!RawReply {
+        var slots: [2]Race = undefined;
+        var race: Io.Select(Race) = .init(self.io, &slots);
+        race.concurrent(.answered, send, .{ self, allocator, .DELETE, path, null, null }) catch
+            return self.send(allocator, .DELETE, path, null, null);
+        const budget: Io.Duration = .fromMilliseconds(@intCast(@min(timeout_ms, std.math.maxInt(i64))));
+        // Without a timer the request is simply waited for.
+        race.concurrent(.expired, Io.sleep, .{ self.io, budget, .awake }) catch {};
+
+        var outcome: Error!RawReply = Error.TransportFailed;
+        if (race.await()) |first| switch (first) {
+            .answered => |reply| outcome = reply,
+            .expired => {},
+        } else |_| {}
+        // Whatever is still running is cancelled; an answer that arrived regardless is freed.
+        while (race.cancel()) |late| switch (late) {
+            .answered => |reply| if (reply) |owned| {
+                var discarded = owned;
+                discarded.deinit(allocator);
+            } else |_| {},
+            .expired => {},
+        };
+        return outcome;
     }
 
     fn deinitThunk(ptr: *anyopaque) void {

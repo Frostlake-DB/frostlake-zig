@@ -57,6 +57,20 @@ fn createScratch(conn: *frostlake.Connection, sql: []const u8) !void {
     response.deinit();
 }
 
+/// Whether this engine refuses a statement pack the caller never asked for.
+///
+/// Only an engine carrying the statement-count gate refuses one; an older engine runs any pack it
+/// is handed. This driver supports both, so a test that rests on the refusal asks first and skips
+/// itself where there is no refusal to observe.
+fn refusesUnaskedPack(conn: *frostlake.Connection) !bool {
+    var accepted = conn.query("SELECT 1; SELECT 2", &.{}) catch |err| {
+        if (err == frostlake.Error.EngineRefused) return true;
+        return err;
+    };
+    accepted.deinit();
+    return false;
+}
+
 test "integration: ping reaches a real engine" {
     const base = (try serverUrl(testing.allocator)) orelse return error.SkipZigTest;
     defer testing.allocator.free(base);
@@ -233,12 +247,48 @@ test "integration: several statements answer with one result set each" {
     var conn = try connect("ZIG_MULTI_DB");
     defer conn.close();
 
+    // A request holds one statement unless the session asks for more, so ask first.
+    // Zero means any number, which keeps the single statements around it working too.
+    var allow = try conn.query("ALTER SESSION SET MULTI_STATEMENT_COUNT = 0", &.{});
+    allow.deinit();
+
     var response = try conn.query("SELECT 1; SELECT 2", &.{});
     defer response.deinit();
 
     try testing.expectEqual(@as(usize, 2), response.setCount());
     try testing.expectEqual(@as(i64, 1), try (try (try response.set(0)).scalar()).asInt());
     try testing.expectEqual(@as(i64, 2), try (try (try response.set(1)).scalar()).asInt());
+}
+
+test "integration: a request may declare its own statement count" {
+    var conn = try connect("ZIG_MULTI_CALL_DB");
+    defer conn.close();
+
+    // The session is still at one statement a request, so the pack is refused on its count alone —
+    // on an engine that counts at all.
+    const gated = try refusesUnaskedPack(&conn);
+
+    // The same pack, saying how many statements it holds. No ALTER SESSION anywhere.
+    var response = try conn.queryWith("SELECT 1; SELECT 2", &.{}, .{ .multi_statement_count = 2 });
+    defer response.deinit();
+    try testing.expectEqual(@as(usize, 2), response.setCount());
+    try testing.expectEqual(@as(i64, 1), try (try (try response.set(0)).scalar()).asInt());
+    try testing.expectEqual(@as(i64, 2), try (try (try response.set(1)).scalar()).asInt());
+
+    // Zero accepts any number.
+    var three = try conn.queryWith("SELECT 1; SELECT 2; SELECT 3", &.{}, .{ .multi_statement_count = 0 });
+    defer three.deinit();
+    try testing.expectEqual(@as(usize, 3), three.setCount());
+
+    // The count belonged to those requests: the session was never moved, so the next pack — asked
+    // for by nobody — is refused again.
+    //
+    // Only an engine carrying the statement-count gate refuses one at all, and this driver
+    // supports older engines than that. Against one of those the refusal never comes, so this ends
+    // in a SKIP rather than a pass: a green tick would claim an engine had been checked for a
+    // refusal it does not make.
+    if (!gated) return error.SkipZigTest;
+    try testing.expectError(frostlake.Error.EngineRefused, conn.query("SELECT 1; SELECT 2", &.{}));
 }
 
 test "integration: a transaction commits" {
@@ -311,6 +361,75 @@ test "integration: column metadata reports type, nullability and scale" {
     try testing.expectEqual(frostlake.ColumnKind.text, b.kind());
 }
 
+test "integration: a VARIANT path reads straight off a positional marker" {
+    var conn = try connect("ZIG_PATH_DB");
+    defer conn.close();
+
+    // The marker ends an expression, so the colon after it is a path and not a second
+    // placeholder. This used to be refused before anything was sent, for mixing two placeholder
+    // styles the caller never mixed.
+    var rows = try conn.query("SELECT ?:a AS V", &.{Value.jsonText("{\"a\":[1,2]}")});
+    defer rows.deinit();
+    try testing.expectEqualStrings("[1,2]", try (try rows.first().scalar()).asText());
+
+    // The spellings that already worked still answer the same thing.
+    var wrapped = try conn.query("SELECT (?):a AS V", &.{Value.jsonText("{\"a\":[1,2]}")});
+    defer wrapped.deinit();
+    try testing.expectEqualStrings("[1,2]", try (try wrapped.first().scalar()).asText());
+}
+
+test "integration: a bound f64 arrives as a FLOAT, not as fixed-point" {
+    var conn = try connect("ZIG_FLOAT_DB");
+    defer conn.close();
+
+    // A bare numeral is fixed-point: the account types 1.5 as NUMBER(2,1) and a whole 2.0 as
+    // NUMBER(1,0), which is the integer 2's own type. Snowflake's own driver binds a double so
+    // that the account answers FLOAT, and this driver's cast is what reproduces that.
+    var rows = try conn.query("SELECT ? AS W, ? AS F, ? AS N", &.{
+        frostlake.Value.of(@as(f64, 2.0)),
+        frostlake.Value.of(@as(f64, 1.5)),
+        frostlake.Value.of(@as(f64, -1.5)),
+    });
+    defer rows.deinit();
+    const set = rows.first();
+
+    try testing.expectEqual(frostlake.ColumnKind.floating, (try set.column(0)).kind());
+    try testing.expectEqual(frostlake.ColumnKind.floating, (try set.column(1)).kind());
+    try testing.expectEqual(frostlake.ColumnKind.floating, (try set.column(2)).kind());
+
+    // And a negative still survives being spliced straight after a minus, where a bare numeral
+    // would open a -- comment.
+    var diff = try conn.query("SELECT 3-? AS V", &.{frostlake.Value.of(@as(f64, -1.5))});
+    defer diff.deinit();
+    const got = diff.first();
+    try testing.expectEqual(frostlake.ColumnKind.floating, (try got.column(0)).kind());
+}
+
+test "integration: a text or binary column reports its declared width" {
+    var conn = try connect("ZIG_WIDTH_DB");
+    defer conn.close();
+
+    try createScratch(&conn, "CREATE TABLE W (V9 VARCHAR(9), B5 BINARY(5), N NUMBER(10,2), VU VARCHAR)");
+
+    var rows = try conn.query("SELECT V9, B5, N, VU FROM W", &.{});
+    defer rows.deinit();
+    const set = rows.first();
+
+    // An engine from before the wire carried a column length sends none, and this driver supports
+    // those: with nothing to report, every column here reports nothing and there is no width to
+    // check. SKIPPED rather than passed — a green tick would claim an engine had been checked for
+    // something it never sends.
+    if ((try set.column(0)).length == null) return error.SkipZigTest;
+
+    // Characters for text, bytes for binary.
+    try testing.expectEqual(@as(?i32, 9), (try set.column(0)).length);
+    try testing.expectEqual(@as(?i32, 5), (try set.column(1)).length);
+    // A number has a precision and a scale and no width at all.
+    try testing.expectEqual(@as(?i32, null), (try set.column(2)).length);
+    // An unbounded column reports the most it could hold.
+    try testing.expectEqual(@as(?i32, 16777216), (try set.column(3)).length);
+}
+
 test "integration: the DSN's scope reaches the session" {
     var conn = try connect("ZIG_SCOPE_DB");
     defer conn.close();
@@ -364,4 +483,118 @@ test "integration: an argument count mismatch never reaches the server" {
     );
     // The connection is untouched by a binding mistake.
     try testing.expect(conn.isValid());
+}
+
+// A session lost behind its connection's back — as the engine's idle reaper or a restart would
+// lose it — and what the driver does next.
+
+/// One raw request to the server named by FROSTLAKE_URL, made past every connection: the
+/// status it answered with, and its body. Caller owns the body.
+fn rawRequest(method: []const u8, path: []const u8) !struct { status: u16, body: []u8 } {
+    const base = (try serverUrl(testing.allocator)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(base);
+    var config = try frostlake.parseDsn(testing.allocator, base, null);
+    defer config.deinit();
+    // base_url is http://host:port.
+    const authority = config.base_url[std.mem.indexOf(u8, config.base_url, "://").? + 3 ..];
+    const colon = std.mem.lastIndexOfScalar(u8, authority, ':').?;
+    const port = try std.fmt.parseInt(u16, authority[colon + 1 ..], 10);
+    const address = try std.Io.net.IpAddress.parse(authority[0..colon], port);
+
+    const stream = try address.connect(testing.io, .{ .mode = .stream });
+    defer stream.close(testing.io);
+    var write_buffer: [512]u8 = undefined;
+    var writer = stream.writer(testing.io, &write_buffer);
+    try writer.interface.print(
+        "{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        .{ method, path, authority },
+    );
+    try writer.interface.flush();
+
+    var read_buffer: [4096]u8 = undefined;
+    var reader = stream.reader(testing.io, &read_buffer);
+    var answer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer answer.deinit();
+    _ = try reader.interface.streamRemaining(&answer.writer);
+    const text = answer.written();
+    const status_start = std.mem.indexOfScalar(u8, text, ' ').? + 1;
+    const status = try std.fmt.parseInt(u16, text[status_start .. status_start + 3], 10);
+    const body_start = (std.mem.indexOf(u8, text, "\r\n\r\n") orelse text.len - 4) + 4;
+    return .{ .status = status, .body = try testing.allocator.dupe(u8, text[body_start..]) };
+}
+
+/// End `session_id` behind its connection's back.
+fn releaseOutOfBand(session_id: []const u8) !void {
+    const path = try std.fmt.allocPrint(testing.allocator, "/api/sessions/{s}", .{session_id});
+    defer testing.allocator.free(path);
+    const reply = try rawRequest("DELETE", path);
+    defer testing.allocator.free(reply.body);
+    try testing.expectEqual(@as(u16, 200), reply.status);
+}
+
+fn activeSessions() !i64 {
+    const reply = try rawRequest("GET", "/api/sessions");
+    defer testing.allocator.free(reply.body);
+    const key = "\"activeSessions\":";
+    const at = (std.mem.indexOf(u8, reply.body, key) orelse return error.TestUnexpectedResult) + key.len;
+    var end = at;
+    while (end < reply.body.len and std.ascii.isDigit(reply.body[end])) end += 1;
+    return std.fmt.parseInt(i64, reply.body[at..end], 10);
+}
+
+/// The connection's database and schema, as `DATABASE.SCHEMA`. Caller owns the text.
+fn currentScope(conn: *frostlake.Connection) ![]u8 {
+    var rows = try conn.query("SELECT CURRENT_DATABASE() || '.' || CURRENT_SCHEMA()", &.{});
+    defer rows.deinit();
+    return testing.allocator.dupe(u8, try (try rows.scalar()).asText());
+}
+
+fn expectScope(conn: *frostlake.Connection, want: []const u8) !void {
+    const scope = try currentScope(conn);
+    defer testing.allocator.free(scope);
+    try testing.expectEqualStrings(want, scope);
+}
+
+test "integration: a released session comes back on the DSN's scope" {
+    var conn = try connect("ZIG_LOST_SCOPE_DB");
+    defer conn.close();
+    try expectScope(&conn, "ZIG_LOST_SCOPE_DB.PUBLIC");
+
+    const released_id = try testing.allocator.dupe(u8, conn.session_id);
+    defer testing.allocator.free(released_id);
+    try releaseOutOfBand(released_id);
+
+    try expectScope(&conn, "ZIG_LOST_SCOPE_DB.PUBLIC");
+    try testing.expect(!std.mem.eql(u8, released_id, conn.session_id));
+}
+
+test "integration: a released session under a transaction is reported" {
+    var conn = try connect("ZIG_LOST_TX_DB");
+    defer conn.close();
+    try createScratch(&conn, "CREATE TABLE lost_t (a INTEGER)");
+
+    try conn.begin();
+    _ = try conn.exec("INSERT INTO lost_t VALUES (1)", &.{});
+    try releaseOutOfBand(conn.session_id);
+
+    try testing.expectError(frostlake.Error.SessionLost, conn.exec("INSERT INTO lost_t VALUES (2)", &.{}));
+    try testing.expectError(frostlake.Error.SessionLost, conn.commit());
+
+    // The connection stays usable, on the DSN's scope, and nothing of the transaction survived.
+    try expectScope(&conn, "ZIG_LOST_TX_DB.PUBLIC");
+    var count = try conn.query("SELECT COUNT(*) FROM lost_t", &.{});
+    defer count.deinit();
+    try testing.expectEqual(@as(i64, 0), try (try count.scalar()).asInt());
+}
+
+test "integration: closing releases the engine session" {
+    const base = (try serverUrl(testing.allocator)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(base);
+    var conn = try frostlake.Connection.open(testing.allocator, testing.io, base);
+    var ran = try conn.query("SELECT 1", &.{});
+    ran.deinit();
+
+    const before = try activeSessions();
+    conn.close();
+    try testing.expectEqual(before - 1, try activeSessions());
 }
