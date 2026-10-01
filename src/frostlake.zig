@@ -73,7 +73,7 @@ pub const RawReply = transport_mod.RawReply;
 /// The driver versions independently of the engine — it speaks the HTTP protocol, not the jar
 /// — so this is a floor rather than a lockstep pin. Ask a running server which one it is with
 /// `SELECT CURRENT_VERSION()`.
-pub const minimum_engine_version = "0.0.7";
+pub const minimum_engine_version = "0.2.0";
 
 /// Shorthand for the common case: open, run one statement, hand back the answer.
 ///
