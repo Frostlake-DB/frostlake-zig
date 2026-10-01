@@ -1,6 +1,6 @@
 .{
     .name = .frostlake,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0x582bb1162c8067e7,
     .minimum_zig_version = "0.16.0",
 
